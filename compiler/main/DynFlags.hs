@@ -382,6 +382,7 @@ data GeneralFlag
    | Opt_GhciHistory
    | Opt_HelpfulErrors
    | Opt_DeferTypeErrors
+   | Opt_DeferTypedHoles
    | Opt_Parallel
    | Opt_GranMacros
    | Opt_PIC
@@ -2719,6 +2720,7 @@ fFlags = [
   ( "cmm-sink",                         Opt_CmmSink, nop ),
   ( "cse",                              Opt_CSE, nop ),
   ( "defer-type-errors",                Opt_DeferTypeErrors, nop ),
+  ( "defer-typed-holes",                Opt_DeferTypedHoles, nop ),
   ( "dicts-cheap",                      Opt_DictsCheap, nop ),
   ( "dicts-strict",                     Opt_DictsStrict, nop ),
   ( "dmd-tx-dict-sel",                  Opt_DmdTxDictSel, nop ),
@@ -2999,8 +3001,11 @@ default_PIC platform =
     (OSDarwin, ArchX86_64) -> [Opt_PIC]
     _                      -> []
 
-impliedFlags :: [(ExtensionFlag, TurnOnFlag, ExtensionFlag)]
-impliedFlags
+impliedGFlags :: [(GeneralFlag, TurnOnFlag, GeneralFlag)]
+impliedGFlags = [(Opt_DeferTypeErrors, turnOn, Opt_DeferTypedHoles)]
+
+impliedXFlags :: [(ExtensionFlag, TurnOnFlag, ExtensionFlag)]
+impliedXFlags
 -- See Note [Updating flag description in the User's Guide]
   = [ (Opt_RankNTypes,                turnOn, Opt_ExplicitForAll)
     , (Opt_ScopedTypeVariables,       turnOn, Opt_ExplicitForAll)
@@ -3345,9 +3350,18 @@ setGeneralFlag   f = upd (setGeneralFlag' f)
 unSetGeneralFlag f = upd (unSetGeneralFlag' f)
 
 setGeneralFlag' :: GeneralFlag -> DynFlags -> DynFlags
-setGeneralFlag' f dflags = gopt_set dflags f
+setGeneralFlag' f dflags = foldr ($) (gopt_set dflags f) deps
+  where
+    deps = [ if turn_on then setGeneralFlag'   d
+                        else unSetGeneralFlag' d
+           | (f', turn_on, d) <- impliedGFlags, f' == f ]
+        -- When you set f, set the ones it implies
+        -- NB: use setGeneralFlag recursively, in case the implied flags
+        --     implies further flags
+
 unSetGeneralFlag' :: GeneralFlag -> DynFlags -> DynFlags
 unSetGeneralFlag' f dflags = gopt_unset dflags f
+   -- When you un-set f, however, we don't un-set the things it implies
 
 --------------------------
 setWarningFlag, unSetWarningFlag :: WarningFlag -> DynP ()
@@ -3364,7 +3378,7 @@ setExtensionFlag' f dflags = foldr ($) (xopt_set dflags f) deps
   where
     deps = [ if turn_on then setExtensionFlag'   d
                         else unSetExtensionFlag' d
-           | (f', turn_on, d) <- impliedFlags, f' == f ]
+           | (f', turn_on, d) <- impliedXFlags, f' == f ]
         -- When you set f, set the ones it implies
         -- NB: use setExtensionFlag recursively, in case the implied flags
         --     implies further flags
