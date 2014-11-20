@@ -5,6 +5,7 @@
 
 \begin{code}
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Finder (
     flushFinderCaches,
@@ -47,7 +48,10 @@ import System.Directory
 import System.FilePath
 import Control.Monad
 import Data.Time
-import Data.List        ( foldl' )
+import Data.List        ( find, foldl' )
+import Control.Exception(IOException, try)
+import Data.Maybe       ( fromMaybe, mapMaybe )
+import qualified Data.Map as M
 
 
 type FileExt = String   -- Filename extension
@@ -258,37 +262,29 @@ uncacheModule hsc_env mod = do
 findHomeModule :: HscEnv -> ModuleName -> IO FindResult
 findHomeModule hsc_env mod_name =
    homeSearchCache hsc_env mod_name $
-   let 
+   let
      dflags = hsc_dflags hsc_env
      home_path = importPaths dflags
      hisuf = hiSuf dflags
      mod = mkModule (thisPackage dflags) mod_name
 
-     source_exts =
-      [ ("hs",   mkHomeModLocationSearched dflags mod_name "hs")
-      , ("lhs",  mkHomeModLocationSearched dflags mod_name "lhs")
-      , ("hsig",  mkHomeModLocationSearched dflags mod_name "hsig")
-      , ("lhsig",  mkHomeModLocationSearched dflags mod_name "lhsig")
-      ]
-
      hi_exts = [ (hisuf,                mkHiOnlyModLocation dflags hisuf)
                , (addBootSuffix hisuf,  mkHiOnlyModLocation dflags hisuf)
                ]
 
-        -- In compilation manager modes, we look for source files in the home
-        -- package because we can compile these automatically.  In one-shot
-        -- compilation mode we look for .hi and .hi-boot files only.
-     exts | isOneShot (ghcMode dflags) = hi_exts
-          | otherwise                  = source_exts
-   in
+     result
+         -- special case for GHC.Prim; we won't find it in the filesystem.
+         -- This is important only when compiling the base package (where
+         -- GHC.Prim is a home module).
+         | mod == gHC_PRIM = return (Found (error "GHC.Prim ModLocation") mod)
 
-  -- special case for GHC.Prim; we won't find it in the filesystem.
-  -- This is important only when compiling the base package (where GHC.Prim
-  -- is a home module).
-  if mod == gHC_PRIM
-        then return (Found (error "GHC.Prim ModLocation") mod)
-        else searchPathExts home_path mod exts
+         -- In compilation manager modes, we look for source files in the home
+         -- package because we can compile these automatically.  In one-shot
+         -- compilation mode we look for .hi and .hi-boot files only.
+         | isOneShot (ghcMode dflags) = searchPathExts home_path mod hi_exts
 
+         | otherwise = searchModuleSrcPath hsc_env home_path mod
+   in result
 
 -- | Search for a module in external packages only.
 findPackageModule :: HscEnv -> Module -> IO FindResult
@@ -344,6 +340,70 @@ findPackageModule_ hsc_env mod pkg_conf =
 
 -- -----------------------------------------------------------------------------
 -- General path searching
+
+searchModuleSrcPath :: HscEnv -> [FilePath] -> Module -> IO FindResult
+searchModuleSrcPath hsc_env paths mod = searchPaths paths
+  where
+    extensions :: [FileExt]
+    extensions = ["hs", "lhs", "hsig", "lhsig"]
+
+    basename :: FilePath
+    basename = moduleNameSlashes (moduleName mod)
+
+    searchPaths :: [FilePath] -> IO FindResult
+    searchPaths (p:ps) = do
+        result <- tryPath p extensions
+        case result of
+            Nothing    -> searchPaths ps
+            Just found -> return found
+
+    searchPaths [] = return NotFound
+                              { fr_paths = paths
+                              , fr_pkg   = Just (modulePackageKey mod)
+                              , fr_mods_hidden = [], fr_pkgs_hidden = []
+                              , fr_suggestions = [] }
+
+    tryPath :: FilePath -> [FileExt] -> IO (Maybe FindResult)
+    tryPath path (ext:exts) = do
+        cond <- doesFileExist (path </> basename <.> ext)
+        if cond
+           then do
+               loc <- mkHomeModLocationSearched (hsc_dflags hsc_env)
+                            (moduleName mod) ext path basename
+               return $ Just (Found loc mod)
+           else tryPath path exts
+
+    tryPath path [] = do
+        files <- try . getDirectoryContents $ path </> modParentBasename
+        case files of
+            Left (e :: IOException) -> return Nothing
+            Right files -> do
+                let haskellSources = M.fromListWith pickExt $ mapMaybe splitName files
+                forM_ (M.toList haskellSources) $ \(fileName, ext) -> do
+                    let fooMod = undefined
+                    loc <- mkHomeModLocationSearched (hsc_dflags hsc_env)
+                                (mkModuleName $ replaceExtension (moduleNameString $ moduleName mod) fileName)
+                                ext path (modParentBasename </> fileName)
+
+                    --addToFinderCache (hsc_FC hsc_env) (moduleName mod) result
+                    addToModLocationCache (hsc_MLC hsc_env) fooMod loc
+                return Nothing
+      where
+        modParentBasename :: FilePath
+        modParentBasename = takeDirectory basename
+
+        splitName :: FilePath -> Maybe (FilePath, FileExt)
+        splitName file
+            | (fileName, '.':ext) <- splitExtension file
+            , ext `elem` extensions = Just (fileName, ext)
+            | (remainder, '.':ext) <- splitExtension file
+            , (fileName, '.':sndExt) <- splitExtension remainder
+            , sndExt `elem` extensions = Just (fileName, sndExt <.> ext)
+            | otherwise = Nothing
+
+        pickExt :: FileExt -> FileExt -> FileExt
+        pickExt old new =
+          fromMaybe old $ find (\x -> x == old || x == new) extensions
 
 searchPathExts
   :: [FilePath]         -- paths to search
